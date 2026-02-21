@@ -12,14 +12,16 @@
 #include "secrets.h"
 
 // Blynk
+#define BLYNK_PRINT Serial
 #include <BlynkSimpleEsp8266.h>
+#include <LittleFS.h>
 
 // ---------- Config ----------
 static const uint64_t SLEEP_US = 5ULL * 60ULL * 1000000ULL; // 5 min
 
 // Wemos D1 ESP32 I2C pins
-static const int I2C_SDA = 21;
-static const int I2C_SCL = 22;
+static const int I2C_SDA =  4;
+static const int I2C_SCL = 5;
 
 static const int STATUS_LED_PIN = 2;
 
@@ -31,8 +33,40 @@ bool bmeOk = false;
 float tC = NAN, h = NAN, pHpa = NAN;
 
 // ---------- Helpers ----------
+struct WiFiCred {
+  String ssid;
+  String pass;
+};
+
+bool loadWiFiCreds(WiFiCred& cred) {
+  if (!LittleFS.begin()) return false;
+  if (!LittleFS.exists("/wifi.json")) return false;
+  File f = LittleFS.open("/wifi.json", "r");
+  if (!f) return false;
+  StaticJsonDocument<128> doc;
+  DeserializationError e = deserializeJson(doc, f);
+  f.close();
+  if (e) return false;
+  const char* s = doc["ssid"] | "";
+  const char* p = doc["pass"] | "";
+  cred.ssid = String(s);
+  cred.pass = String(p);
+  return cred.ssid.length() > 0;
+}
+
+bool saveWiFiCreds(const String& ssid, const String& pass) {
+  if (!LittleFS.begin()) return false;
+  File f = LittleFS.open("/wifi.json", "w");
+  if (!f) return false;
+  StaticJsonDocument<128> doc;
+  doc["ssid"] = ssid;
+  doc["pass"] = pass;
+  bool ok = (serializeJson(doc, f) > 0);
+  f.close();
+  return ok;
+}
 void goToSleep() {
-  WiFi.disconnect(true);
+  WiFi.disconnect();
   WiFi.mode(WIFI_OFF);
 
   delay(50);
@@ -60,6 +94,38 @@ bool readBME() {
 
 bool connectWiFiWithPortal() {
   WiFi.mode(WIFI_STA);
+  WiFi.persistent(true);
+  WiFi.setAutoReconnect(true);
+
+  WiFiCred cred;
+  if (loadWiFiCreds(cred)) {
+    WiFi.begin(cred.ssid.c_str(), cred.pass.length() ? cred.pass.c_str() : nullptr);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) {
+      delay(100);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      return true;
+    }
+  }
+
+  // Intento 1: reconectar usando credenciales guardadas por el SDK
+  String ssid = WiFi.SSID();
+  String pass = WiFi.psk();
+  if (ssid.length() > 0) {
+    Serial.print("Reconnecting to saved WiFi: ");
+    Serial.println(ssid);
+    WiFi.begin(ssid.c_str(), pass.length() ? pass.c_str() : nullptr);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) {
+      delay(100);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      saveWiFiCreds(WiFi.SSID(), WiFi.psk());
+      return true;
+    }
+    Serial.println("Saved WiFi reconnect failed, opening portal...");
+  }
 
   WiFiManager wm;
   wm.setConfigPortalTimeout(180); // max 3 min
@@ -69,20 +135,21 @@ bool connectWiFiWithPortal() {
   // SSID: ESP32-BME280-SETUP
   bool ok = wm.autoConnect("ESP32-BME280-SETUP");
   if (!ok) return false;
+  delay(200);
+  saveWiFiCreds(WiFi.SSID(), WiFi.psk());
 
   return (WiFi.status() == WL_CONNECTED);
 }
 
 bool sendToBlynk() {
   // Push mode: connect -> send -> disconnect
-  Blynk.config(BLYNK_AUTH_TOKEN);
+  Blynk.config(BLYNK_AUTH_TOKEN, "blynk.cloud", 80);
 
-  unsigned long start = millis();
-  while (!Blynk.connected() && millis() - start < 8000) {
-    Blynk.run();
-    delay(10);
+  delay(300);
+  bool connected = Blynk.connect(30000);
+  if (!connected) {
+    return false;
   }
-  if (!Blynk.connected()) return false;
 
   // Virtual Pins:
   // V0: Temperature, V1: Humidity, V2: Pressure
@@ -92,7 +159,7 @@ bool sendToBlynk() {
 
   // Give time to flush packets
   unsigned long t0 = millis();
-  while (millis() - t0 < 300) {
+  while (millis() - t0 < 600) {
     Blynk.run();
     delay(5);
   }
